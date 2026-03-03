@@ -137,6 +137,10 @@ def tk_all_to_all_func(
     # Wait for all ranks to observe barrier initialization.
     torch.distributed.barrier()
     tk_kernel(output_tk, input_tk, barrier_tk, scatter_idx, gather_idx)
+    # Launch is async. First wait local stream completion, then wait all ranks so every
+    # peer write into this rank's output is globally complete before wrappers destruct.
+    torch.cuda.synchronize(input.device)
+    torch.distributed.barrier()
 
     return output
 
