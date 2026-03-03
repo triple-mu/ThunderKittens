@@ -1,5 +1,6 @@
 import os
 import sys
+from functools import lru_cache
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -11,25 +12,21 @@ from common import (
     init_distributed_environment,
 )
 
-try:
-    from _C import TKParallelTensor, tk_all_to_all_new as _tk_all_to_all
-except ImportError:
-    from _C import TKParallelTensor, tk_all_to_all as _tk_all_to_all
-
-
 def nccl_all_to_all_func(
-    output: torch.Tensor,
     input: torch.Tensor,
-    local_world_size: int,
     scatter_idx: int,
     gather_idx: int,
-) -> None:
+) -> torch.Tensor:
+    local_world_size = torch.distributed.get_world_size()
+
     if scatter_idx == 2 and gather_idx == 1:
         # [B, S_local, N_global, D] -> [B, S_global, N_local, D]
         b, s_local, n_global, d = input.shape
         if n_global % local_world_size != 0:
             raise RuntimeError("N_global must be divisible by local_world_size")
         n_local = n_global // local_world_size
+
+        output = torch.empty((b, s_local * local_world_size, n_local, d), dtype=input.dtype, device=input.device)
 
         input_t = (
             input.view(b, s_local, local_world_size, n_local, d)
@@ -51,6 +48,8 @@ def nccl_all_to_all_func(
             raise RuntimeError("S_global must be divisible by local_world_size")
         s_local = s_global // local_world_size
 
+        output = torch.empty((b, s_local, n_local * local_world_size, d), dtype=input.dtype, device=input.device)
+
         input_t = (
             input.view(b, local_world_size, s_local, n_local, d)
             .permute(1, 0, 2, 3, 4)
@@ -67,19 +66,82 @@ def nccl_all_to_all_func(
     else:
         raise RuntimeError("Only (scatter=2,gather=1) and (scatter=1,gather=2) are supported")
 
+    return output
+
+
+@lru_cache(maxsize=1)
+def _get_tk_extension():
+    try:
+        from _C import TKParallelTensor, tk_all_to_all_new as tk_kernel
+    except ImportError:
+        from _C import TKParallelTensor, tk_all_to_all as tk_kernel
+    return TKParallelTensor, tk_kernel
+
+
+_BARRIER_CACHE = {}
+
 
 def tk_all_to_all_func(
-    output: TKParallelTensor,
-    input: TKParallelTensor,
-    barrier: TKParallelTensor,
+    input: torch.Tensor,
     scatter_idx: int,
     gather_idx: int,
-) -> None:
-    _tk_all_to_all(output, input, barrier, scatter_idx, gather_idx)
+) -> torch.Tensor:
+    if not torch.distributed.is_initialized():
+        raise RuntimeError("torch.distributed is not initialized")
+    if not input.is_cuda:
+        raise RuntimeError("input must be a CUDA tensor")
+    if input.dim() != 4:
+        raise RuntimeError("input must be a 4D tensor")
+    if input.dtype != torch.bfloat16:
+        raise RuntimeError("input dtype must be torch.bfloat16")
+
+    local_rank = input.device.index
+    local_world_size = torch.distributed.get_world_size()
+
+    if local_world_size not in (2, 4, 8):
+        raise RuntimeError("tk_all_to_all_func requires world_size in {2, 4, 8}")
+
+    b, s, n, d = input.shape
+    if scatter_idx == 2 and gather_idx == 1:
+        if n % local_world_size != 0:
+            raise RuntimeError("For scatter=2,gather=1, N must be divisible by world_size")
+        output_shape = (b, s * local_world_size, n // local_world_size, d)
+    elif scatter_idx == 1 and gather_idx == 2:
+        if s % local_world_size != 0:
+            raise RuntimeError("For scatter=1,gather=2, S must be divisible by world_size")
+        output_shape = (b, s // local_world_size, n * local_world_size, d)
+    else:
+        raise RuntimeError("Only (scatter=2,gather=1) and (scatter=1,gather=2) are supported")
+
+    TKParallelTensor, tk_kernel = _get_tk_extension()
+
+    input_c = input.contiguous()
+    output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+
+    input_tk = TKParallelTensor(input_c, local_rank, local_world_size, False)
+    output_tk = TKParallelTensor(output, local_rank, local_world_size, False)
+
+    key = (local_rank, local_world_size)
+    barrier_tk = _BARRIER_CACHE.get(key)
+    if barrier_tk is None:
+        barrier_tk = TKParallelTensor(
+            (1, 1),
+            dtype=torch.int,
+            local_rank=local_rank,
+            local_world_size=local_world_size,
+            multicast=True,
+        )
+        _BARRIER_CACHE[key] = barrier_tk
+    barrier_tk.data_.zero_()
+
+    # Wait for all ranks to observe barrier initialization.
+    torch.distributed.barrier()
+    tk_kernel(output_tk, input_tk, barrier_tk, scatter_idx, gather_idx)
+
+    return output
 
 
 def run_case(
-    local_rank: int,
     local_world_size: int,
     scatter_idx: int,
     gather_idx: int,
@@ -88,6 +150,7 @@ def run_case(
     n_local: int = 13,
     d: int = 64,
 ) -> None:
+    local_rank = torch.distributed.get_rank()
     device = f"cuda:{local_rank}"
 
     n_global = n_local * local_world_size
@@ -103,43 +166,12 @@ def run_case(
         raise RuntimeError("Unsupported scatter/gather pair")
 
     input_ref = torch.randn(input_shape, dtype=torch.bfloat16, device=device)
-    output_nccl = torch.empty(output_shape, dtype=torch.bfloat16, device=device)
-
-    input_tk = TKParallelTensor(
-        input_shape,
-        dtype=torch.bfloat16,
-        local_rank=local_rank,
-        local_world_size=local_world_size,
-        multicast=False,
-    )
-    output_tk = TKParallelTensor(
-        output_shape,
-        dtype=torch.bfloat16,
-        local_rank=local_rank,
-        local_world_size=local_world_size,
-        multicast=False,
-    )
-    barrier_tk = TKParallelTensor(
-        (1, 1),
-        dtype=torch.int,
-        local_rank=local_rank,
-        local_world_size=local_world_size,
-        multicast=True,
-    )
-
-    input_tk.data_.copy_(input_ref)
-    output_tk.data_.zero_()
-    barrier_tk.data_.zero_()
-
-    # Wait for barrier memory to be visible on all ranks.
-    torch.distributed.barrier()
-
-    nccl_all_to_all_func(output_nccl, input_ref, local_world_size, scatter_idx, gather_idx)
-    tk_all_to_all_func(output_tk, input_tk, barrier_tk, scatter_idx, gather_idx)
+    output_nccl = nccl_all_to_all_func(input_ref, scatter_idx, gather_idx)
+    output_tk = tk_all_to_all_func(input_ref, scatter_idx, gather_idx)
     torch.cuda.synchronize()
 
-    if not torch.equal(output_tk.data_, output_nccl):
-        diff = (output_tk.data_ - output_nccl).abs()
+    if not torch.equal(output_tk, output_nccl):
+        diff = (output_tk - output_nccl).abs()
         max_diff = diff.max().item()
         mean_diff = diff.mean().item()
         raise AssertionError(
@@ -155,15 +187,18 @@ def run_case(
 
 
 def main() -> None:
-    local_rank, local_world_size = init_distributed_environment()
+    _, local_world_size = init_distributed_environment()
 
     if local_world_size not in (2, 4, 8):
         raise RuntimeError("benchmark_new.py requires LOCAL_WORLD_SIZE in {2, 4, 8}")
 
     try:
         # Keep this intentionally small. We only verify correctness.
-        run_case(local_rank, local_world_size, scatter_idx=2, gather_idx=1)
-        run_case(local_rank, local_world_size, scatter_idx=1, gather_idx=2)
+        # Cover both aligned and non-aligned S cases.
+        run_case(local_world_size, scatter_idx=2, gather_idx=1, s_local=16)
+        run_case(local_world_size, scatter_idx=1, gather_idx=2, s_local=16)
+        run_case(local_world_size, scatter_idx=2, gather_idx=1, s_local=13)
+        run_case(local_world_size, scatter_idx=1, gather_idx=2, s_local=13)
         clean_print("All correctness tests passed.", print_once=True)
     finally:
         destroy_distributed_environment()

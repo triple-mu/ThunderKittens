@@ -7,8 +7,8 @@ namespace all_to_all_new {
 
 struct config {
     static constexpr int CLUSTER_SIZE = 1;
-    static constexpr int MIN_BLOCKS_PER_SM = 8;
-    static constexpr int NUM_THREADS = 1;
+    static constexpr int MIN_BLOCKS_PER_SM = 2;
+    static constexpr int NUM_THREADS = 128;
 };
 
 template <int NUM_DEVICES, bool SCATTER_N_GATHER_S>
@@ -34,10 +34,11 @@ struct globals {
     const int dev_idx;
 
     __host__ inline dim3 grid() const {
+        const int d_blocks = input.cols() / D_BLOCK_SIZE;
         return dim3(
-            input.cols() / D_BLOCK_SIZE,
-            input.depth() / S_BLOCK_SIZE,
-            input.batch() * input.rows()
+            input.rows() * d_blocks,
+            (input.depth() + S_BLOCK_SIZE - 1) / S_BLOCK_SIZE,
+            input.batch()
         );
     }
 
@@ -62,10 +63,7 @@ static inline void check_shapes(const globals<NUM_DEVICES, SCATTER_N_GATHER_S> &
         "D must be divisible by ", G_t::D_BLOCK_SIZE
     );
 
-    TORCH_CHECK(
-        G.input.depth() % G_t::S_BLOCK_SIZE == 0 && G.output.depth() % G_t::S_BLOCK_SIZE == 0,
-        "S dimensions must be divisible by ", G_t::S_BLOCK_SIZE
-    );
+    TORCH_CHECK(G.input.depth() > 0 && G.output.depth() > 0, "S dimensions must be positive");
 
     if constexpr (SCATTER_N_GATHER_S) {
         // [B, S_local, N_global, D] -> [B, S_global, N_local, D]
@@ -103,51 +101,140 @@ __device__ inline void kernel(const globals<NUM_DEVICES, SCATTER_N_GATHER_S> &G)
     typename G_t::shared_tile &tile =
         allocator.template allocate<typename G_t::shared_tile>();
 
-    const int d_block_idx = static_cast<int>(blockIdx.x);
+    const int d_blocks = G.input.cols() / G_t::D_BLOCK_SIZE;
+    const int x_idx = static_cast<int>(blockIdx.x);
+    const int n_idx = x_idx / d_blocks;
+    const int d_block_idx = x_idx - n_idx * d_blocks;
     const int s_block_idx = static_cast<int>(blockIdx.y);
+    const int batch_idx = static_cast<int>(blockIdx.z);
+    const int s_start = s_block_idx * G_t::S_BLOCK_SIZE;
 
-    const int z_idx = static_cast<int>(blockIdx.z);
-    const int n_size = G.input.rows();
-    const int batch_idx = z_idx / n_size;
-    const int n_idx = z_idx - batch_idx * n_size;
-
-    __shared__ semaphore arrived;
-    init_semaphore(arrived, 0, 1);
-    tma::expect_bytes(arrived, sizeof(tile));
-    tma::load_async<dim::DEPTH, cache_policy::NORMAL>(
-        tile,
-        G.input[G.dev_idx],
-        {batch_idx, s_block_idx, n_idx, d_block_idx},
-        arrived
-    );
-
-    int out_s_block_idx;
-    int out_n_idx;
-    int dst_dev_idx;
+    int dst_dev_idx_base = 0;
+    int out_n_idx_base = 0;
+    int out_s_block_idx = 0;
+    bool tma_store_eligible = false;
 
     if constexpr (SCATTER_N_GATHER_S) {
         // scatter axis: N(rows), gather axis: S(depth)
-        const int s_local_blocks = G.input.depth() / G_t::S_BLOCK_SIZE;
         const int n_local = G.output.rows();
+        const int out_s_start = G.dev_idx * G.input.depth() + s_start;
 
-        dst_dev_idx = n_idx / n_local;
-        out_n_idx = n_idx - dst_dev_idx * n_local;
-        out_s_block_idx = G.dev_idx * s_local_blocks + s_block_idx;
+        dst_dev_idx_base = n_idx / n_local;
+        out_n_idx_base = n_idx - dst_dev_idx_base * n_local;
+
+        tma_store_eligible = (out_s_start % G_t::S_BLOCK_SIZE == 0);
+        out_s_block_idx = out_s_start / G_t::S_BLOCK_SIZE;
     } else {
         // scatter axis: S(depth), gather axis: N(rows)
-        const int s_local_blocks = G.output.depth() / G_t::S_BLOCK_SIZE;
+        const int s_local = G.output.depth();
+        const int dst_dev_first = s_start / s_local;
+        const int dst_dev_last = (s_start + G_t::S_BLOCK_SIZE - 1) / s_local;
 
-        dst_dev_idx = s_block_idx / s_local_blocks;
-        out_s_block_idx = s_block_idx - dst_dev_idx * s_local_blocks;
-        out_n_idx = G.dev_idx * G.input.rows() + n_idx;
+        out_n_idx_base = G.dev_idx * G.input.rows() + n_idx;
+
+        if (dst_dev_first == dst_dev_last) {
+            const int out_s_start = s_start - dst_dev_first * s_local;
+            if (out_s_start % G_t::S_BLOCK_SIZE == 0) {
+                tma_store_eligible = true;
+                dst_dev_idx_base = dst_dev_first;
+                out_s_block_idx = out_s_start / G_t::S_BLOCK_SIZE;
+            }
+        }
     }
 
-    wait(arrived, 0);
-    tma::store_async<dim::DEPTH, cache_policy::NORMAL>(
-        G.output[dst_dev_idx],
-        tile,
-        {batch_idx, out_s_block_idx, out_n_idx, d_block_idx}
-    );
+    __shared__ semaphore arrived;
+    const bool full_s_block = (s_start + G_t::S_BLOCK_SIZE) <= G.input.depth();
+
+    if (full_s_block) {
+        if (threadIdx.x == 0) {
+            init_semaphore(arrived, 0, 1);
+            tma::expect_bytes(arrived, sizeof(tile));
+            tma::load_async<dim::DEPTH, cache_policy::NORMAL>(
+                tile,
+                G.input[G.dev_idx],
+                {batch_idx, s_block_idx, n_idx, d_block_idx},
+                arrived
+            );
+        }
+        __syncthreads();
+
+        // Fast path: full tile and destination tile is also aligned.
+        if (tma_store_eligible) {
+            if (threadIdx.x == 0) {
+                wait(arrived, 0);
+                tma::store_async<dim::DEPTH, cache_policy::NORMAL>(
+                    G.output[dst_dev_idx_base],
+                    tile,
+                    {batch_idx, out_s_block_idx, out_n_idx_base, d_block_idx}
+                );
+            }
+            return;
+        }
+
+        // Hybrid path: TMA load + scalar store for this tile.
+        if (threadIdx.x == 0) {
+            wait(arrived, 0);
+        }
+        __syncthreads();
+
+        for (int idx = static_cast<int>(threadIdx.x);
+             idx < G_t::S_BLOCK_SIZE * G_t::D_BLOCK_SIZE;
+             idx += config::NUM_THREADS) {
+            const int row_in_block = idx / G_t::D_BLOCK_SIZE;
+            const int col_in_block = idx - row_in_block * G_t::D_BLOCK_SIZE;
+            const int s_idx = s_start + row_in_block;
+            const int d_idx = d_block_idx * G_t::D_BLOCK_SIZE + col_in_block;
+
+            int dst_dev_idx;
+            int out_s_idx;
+            int out_n_idx;
+
+            if constexpr (SCATTER_N_GATHER_S) {
+                dst_dev_idx = dst_dev_idx_base;
+                out_n_idx = out_n_idx_base;
+                out_s_idx = G.dev_idx * G.input.depth() + s_idx;
+            } else {
+                const int s_local = G.output.depth();
+                dst_dev_idx = s_idx / s_local;
+                out_s_idx = s_idx - dst_dev_idx * s_local;
+                out_n_idx = out_n_idx_base;
+            }
+
+            const coord<> out_idx{batch_idx, out_s_idx, out_n_idx, d_idx};
+            G.output[dst_dev_idx][out_idx] = tile[{row_in_block, col_in_block}];
+        }
+        return;
+    }
+
+    // Tail path: only for the final partial S tile.
+    const int s_tail = G.input.depth() - s_start;
+    for (int idx = static_cast<int>(threadIdx.x);
+         idx < s_tail * G_t::D_BLOCK_SIZE;
+         idx += config::NUM_THREADS) {
+        const int row_in_tail = idx / G_t::D_BLOCK_SIZE;
+        const int col_in_block = idx - row_in_tail * G_t::D_BLOCK_SIZE;
+        const int s_idx = s_start + row_in_tail;
+        const int d_idx = d_block_idx * G_t::D_BLOCK_SIZE + col_in_block;
+
+        int dst_dev_idx;
+        int out_s_idx;
+        int out_n_idx;
+
+        if constexpr (SCATTER_N_GATHER_S) {
+            dst_dev_idx = dst_dev_idx_base;
+            out_n_idx = out_n_idx_base;
+            out_s_idx = G.dev_idx * G.input.depth() + s_idx;
+        } else {
+            const int s_local = G.output.depth();
+            dst_dev_idx = s_idx / s_local;
+            out_s_idx = s_idx - dst_dev_idx * s_local;
+            out_n_idx = out_n_idx_base;
+        }
+
+        const coord<> in_idx{batch_idx, s_idx, n_idx, d_idx};
+        const coord<> out_idx{batch_idx, out_s_idx, out_n_idx, d_idx};
+        G.output[dst_dev_idx][out_idx] = G.input[G.dev_idx][in_idx];
+    }
 }
 
 } // namespace all_to_all_new
