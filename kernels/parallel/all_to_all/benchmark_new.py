@@ -116,10 +116,26 @@ def tk_all_to_all_func(
     TKParallelTensor, tk_kernel = _get_tk_extension()
 
     input_c = input.contiguous()
-    output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
 
-    input_tk = TKParallelTensor(input_c, local_rank, local_world_size, False)
-    output_tk = TKParallelTensor(output, local_rank, local_world_size, False)
+    # IMPORTANT:
+    # Use TK-managed allocations (VMM path) instead of wrapping pre-allocated torch tensors
+    # (LEGACY IPC path). For this all-to-all kernel, remote writes are reliable on the VMM path.
+    input_tk = TKParallelTensor(
+        tuple(input_c.shape),
+        dtype=input_c.dtype,
+        local_rank=local_rank,
+        local_world_size=local_world_size,
+        multicast=False,
+    )
+    input_tk.data_.copy_(input_c)
+
+    output_tk = TKParallelTensor(
+        output_shape,
+        dtype=input.dtype,
+        local_rank=local_rank,
+        local_world_size=local_world_size,
+        multicast=False,
+    )
 
     key = (local_rank, local_world_size)
     barrier_tk = _BARRIER_CACHE.get(key)
@@ -142,7 +158,8 @@ def tk_all_to_all_func(
     torch.cuda.synchronize(input.device)
     torch.distributed.barrier()
 
-    return output
+    # Return plain torch.Tensor while keeping API identical to PyTorch-style functions.
+    return output_tk.data_.clone()
 
 
 def run_case(
