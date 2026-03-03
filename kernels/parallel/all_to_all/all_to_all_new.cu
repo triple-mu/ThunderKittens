@@ -167,6 +167,7 @@ __device__ inline void kernel(const globals<NUM_DEVICES, SCATTER_N_GATHER_S> &G)
                     tile,
                     {batch_idx, out_s_block_idx, out_n_idx_base, d_block_idx}
                 );
+                tma::store_async_wait();
             }
             return;
         }
